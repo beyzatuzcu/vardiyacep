@@ -1,0 +1,186 @@
+<!doctype html>
+<html lang="tr">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+  <meta name="theme-color" content="#0f766e" />
+  <meta name="description" content="Excel vardiya listesini kişi bazlı takvime dönüştüren, cihazda çalışan mobil uygulama." />
+  <link rel="manifest" href="manifest.webmanifest" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+  <meta name="apple-mobile-web-app-title" content="VardiyaCep" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <link rel="icon" href="icons/icon-192.png" />
+  <link rel="apple-touch-icon" href="icons/icon-192.png" />
+  <link rel="stylesheet" href="styles.css" />
+  <title>VardiyaCep</title>
+</head>
+<body>
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+
+  <header class="topbar">
+    <div class="brand">
+      <div class="brand-mark" aria-hidden="true">V</div>
+      <div>
+        <h1>VardiyaCep</h1>
+        <p>Vardiyan cebinde, hatırlatıcın yanında.</p>
+      </div>
+    </div>
+    <button id="installBtn" class="button ghost compact hidden" type="button">Uygulamayı yükle</button>
+  </header>
+
+  <main class="shell">
+    <section id="importPanel" class="hero card">
+      <div class="hero-copy">
+        <span class="eyebrow">Excel → Mobil Takvim</span>
+        <h2>Aylık çalışma listesini saniyeler içinde kişisel vardiya ekranına çevir.</h2>
+        <p>Dosya yalnızca bu cihazda işlenir. Sunucuya gönderilmez.</p>
+      </div>
+      <div class="import-actions">
+        <label class="button primary file-button">
+          Excel seç
+          <input id="fileInput" type="file" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" />
+        </label>
+        <button id="sampleBtn" class="button secondary" type="button">Yüklü örneği aç</button>
+      </div>
+      <div id="dropZone" class="drop-zone" tabindex="0">
+        <strong>Excel dosyasını buraya bırak</strong>
+        <span>.xlsx • Sicil, Adı Soyadı ve tarih sütunları otomatik bulunur</span>
+      </div>
+      <div id="parseStatus" class="parse-status hidden"></div>
+    </section>
+
+    <section id="appPanel" class="hidden">
+      <div class="toolbar card">
+        <div class="field grow">
+          <label for="personSearch">Personel ara</label>
+          <input id="personSearch" type="search" placeholder="Ad, sicil, ekip..." autocomplete="off" />
+          <div id="personResults" class="search-results hidden"></div>
+        </div>
+        <div class="selected-person">
+          <span id="selectedInitials" class="avatar">—</span>
+          <div>
+            <strong id="selectedName">Personel seçin</strong>
+            <small id="selectedMeta">—</small>
+          </div>
+        </div>
+        <button id="changeFileBtn" class="button ghost compact" type="button">Dosyayı değiştir</button>
+      </div>
+
+      <nav class="tabs card" aria-label="Uygulama bölümleri">
+        <button class="tab active" data-tab="home" type="button">Özet</button>
+        <button class="tab" data-tab="calendar" type="button">Takvim</button>
+        <button class="tab" data-tab="reminders" type="button">Hatırlatıcı</button>
+        <button class="tab" data-tab="settings" type="button">Ayarlar</button>
+      </nav>
+
+      <section id="tab-home" class="tab-page active">
+        <div class="headline-grid">
+          <article class="shift-card today card">
+            <div class="card-label">Bugün</div>
+            <div id="todayDate" class="date-line">—</div>
+            <div id="todayBadge" class="shift-badge neutral">—</div>
+            <h3 id="todayTitle">Vardiya bilgisi yok</h3>
+            <p id="todayDetail">Bir personel seçin.</p>
+          </article>
+          <article class="shift-card tomorrow card emphasis">
+            <div class="card-label">Yarın</div>
+            <div id="tomorrowDate" class="date-line">—</div>
+            <div id="tomorrowBadge" class="shift-badge neutral">—</div>
+            <h3 id="tomorrowTitle">Yarın için bilgi yok</h3>
+            <p id="tomorrowDetail">Hatırlatıcı kurulduğunda bu bilgi bildirim olarak gösterilir.</p>
+          </article>
+        </div>
+
+        <div id="statsGrid" class="stats-grid"></div>
+
+        <article class="card section-card">
+          <div class="section-heading">
+            <div>
+              <span class="eyebrow">Yaklaşan program</span>
+              <h3>Sonraki 7 gün</h3>
+            </div>
+            <button id="icsQuickBtn" class="button ghost compact" type="button">Takvime aktar</button>
+          </div>
+          <div id="upcomingList" class="schedule-list empty-state">Personel seçildiğinde program burada görünür.</div>
+        </article>
+      </section>
+
+      <section id="tab-calendar" class="tab-page">
+        <article class="card section-card">
+          <div class="section-heading calendar-heading">
+            <button id="prevMonthBtn" class="icon-button" type="button" aria-label="Önceki ay">‹</button>
+            <div>
+              <span class="eyebrow">Aylık görünüm</span>
+              <h3 id="calendarMonth">—</h3>
+            </div>
+            <button id="nextMonthBtn" class="icon-button" type="button" aria-label="Sonraki ay">›</button>
+          </div>
+          <div class="weekday-row" aria-hidden="true">
+            <span>Pzt</span><span>Sal</span><span>Çar</span><span>Per</span><span>Cum</span><span>Cmt</span><span>Paz</span>
+          </div>
+          <div id="calendarGrid" class="calendar-grid"></div>
+          <div id="legend" class="legend"></div>
+        </article>
+      </section>
+
+      <section id="tab-reminders" class="tab-page">
+        <div class="settings-grid">
+          <article class="card section-card">
+            <span class="eyebrow">Bildirim</span>
+            <h3>“Yarın sabahçısın” hatırlatıcısı</h3>
+            <p class="muted">Seçili personelin ertesi gün vardiyasını belirlediğiniz saatte bildirir.</p>
+            <div class="field inline-field">
+              <label for="reminderTime">Bir gün önce</label>
+              <input id="reminderTime" type="time" value="20:00" />
+            </div>
+            <div class="button-row">
+              <button id="enableNotificationsBtn" class="button primary" type="button">Bildirimi aç</button>
+              <button id="testNotificationBtn" class="button secondary" type="button">Test bildirimi</button>
+            </div>
+            <div id="notificationState" class="status-box">Bildirim izni henüz kontrol edilmedi.</div>
+          </article>
+
+          <article class="card section-card">
+            <span class="eyebrow">Kesintisiz seçenek</span>
+            <h3>Telefon takvimine aktar</h3>
+            <p class="muted">Uygulama kapalıyken de işletim sistemi takviminden alarm almak için seçili kişinin tüm programını aktarır.</p>
+            <div class="field inline-field">
+              <label for="calendarReminderTime">Alarm saati</label>
+              <input id="calendarReminderTime" type="time" value="20:00" />
+            </div>
+            <button id="icsBtn" class="button primary" type="button">Takvim dosyasını indir (.ics)</button>
+            <p class="microcopy">İndirilen dosyayı telefonda açıp takvime ekleyin.</p>
+          </article>
+        </div>
+      </section>
+
+      <section id="tab-settings" class="tab-page">
+        <div class="settings-grid">
+          <article class="card section-card">
+            <span class="eyebrow">Vardiya saatleri</span>
+            <h3>Kodları ve başlangıç saatlerini düzenle</h3>
+            <div id="mappingTable" class="mapping-table"></div>
+          </article>
+          <article class="card section-card">
+            <span class="eyebrow">Veri yönetimi</span>
+            <h3>Cihazdaki kayıtlar</h3>
+            <p id="datasetSummary" class="muted">—</p>
+            <div class="button-column">
+              <button id="reselectPersonBtn" class="button secondary" type="button">Personeli yeniden seç</button>
+              <button id="clearDataBtn" class="button danger" type="button">Kaydedilen verileri sil</button>
+            </div>
+          </article>
+        </div>
+      </section>
+    </section>
+  </main>
+
+  <footer>
+    <span>VardiyaCep</span>
+    <span>Excel verisi cihazınızdan çıkmaz.</span>
+  </footer>
+
+  <script src="app.js" defer></script>
+</body>
+</html>
