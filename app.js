@@ -1,7 +1,7 @@
 "use strict";
 
 const $ = (id) => document.getElementById(id);
-const STORAGE_KEY = "vardiyacep.dataset.v1";
+const STORAGE_KEY = "vardiyacep.dataset.v2";
 const PERSON_KEY = "vardiyacep.person.v1";
 const MAPPING_KEY = "vardiyacep.mapping.v1";
 const REMINDER_KEY = "vardiyacep.reminder.v1";
@@ -244,6 +244,102 @@ function detectHeader(rows, requiredSets) {
 function findColumn(normalized, keys) {
   return normalized.findIndex(v => keys.some(k => v.includes(k)));
 }
+
+const MONTH_HINTS = {
+  ocak: 1, subat: 2, mart: 3, nisan: 4, mayis: 5, haziran: 6,
+  temmuz: 7, agustos: 8, eylul: 9, ekim: 10, kasim: 11, aralik: 12
+};
+const WEEKDAY_HINTS = {
+  pazar: 0, pazartesi: 1, sali: 2, carsamba: 3, persembe: 4, cuma: 5, cumartesi: 6
+};
+function detectMonthHint(...values) {
+  for (const value of values) {
+    const normalized = normalizeText(value);
+    for (const [name, month] of Object.entries(MONTH_HINTS)) {
+      if (normalized.includes(name)) return {month, source: String(value || "")};
+    }
+  }
+  return null;
+}
+function detectYearHint(...values) {
+  for (const value of values) {
+    const match = String(value || "").match(/(?:^|\D)(20\d{2})(?:\D|$)/);
+    if (match) return Number(match[1]);
+  }
+  return null;
+}
+function weekdayHint(value) {
+  const normalized = normalizeText(value);
+  for (const [name, day] of Object.entries(WEEKDAY_HINTS)) {
+    if (normalized === name || normalized.includes(name)) return day;
+  }
+  return null;
+}
+function makeIsoDate(year, month, day) {
+  const date = new Date(year, month - 1, day);
+  if (date.getFullYear() !== year || date.getMonth() !== month - 1 || date.getDate() !== day) return null;
+  return `${year}-${String(month).padStart(2,"0")}-${String(day).padStart(2,"0")}`;
+}
+function weekdayScore(dateCols, weekdayRow) {
+  let compared = 0, matched = 0;
+  for (const {index, date} of dateCols) {
+    const expected = weekdayHint(weekdayRow?.[index]);
+    if (expected === null) continue;
+    compared++;
+    if (localDate(date)?.getDay() === expected) matched++;
+  }
+  return {compared, matched};
+}
+function correctDateColumns(dateCols, sheet, header, sourceFile) {
+  const fileHint = detectMonthHint(sourceFile);
+  const sheetHint = detectMonthHint(sheet.name);
+  const hint = fileHint || sheetHint;
+  if (!hint || !dateCols.length) return {dateCols, correction: null};
+
+  const rawDates = dateCols.map(x => localDate(x.date)).filter(Boolean);
+  const rawYear = rawDates.length
+    ? rawDates.map(d => d.getFullYear()).sort((a,b) =>
+        rawDates.filter(x => x.getFullYear() === b).length - rawDates.filter(x => x.getFullYear() === a).length
+      )[0]
+    : new Date().getFullYear();
+  const explicitYear = detectYearHint(sourceFile, sheet.name);
+  const years = [...new Set([explicitYear, rawYear, rawYear - 1, rawYear + 1, new Date().getFullYear()].filter(Boolean))];
+  const weekdayRow = header.index > 0 ? sheet.rows[header.index - 1] || [] : [];
+  const originalScore = weekdayScore(dateCols, weekdayRow);
+  let best = null;
+
+  for (const year of years) {
+    const mapped = [];
+    let valid = true;
+    for (const item of dateCols) {
+      const day = localDate(item.date)?.getDate();
+      const date = makeIsoDate(year, hint.month, day);
+      if (!date) { valid = false; break; }
+      mapped.push({...item, date});
+    }
+    if (!valid) continue;
+    const score = weekdayScore(mapped, weekdayRow);
+    if (!best || score.matched > best.score.matched || (score.matched === best.score.matched && score.compared > best.score.compared)) {
+      best = {mapped, year, score};
+    }
+  }
+
+  if (!best) return {dateCols, correction: null};
+  const originalMonths = new Set(rawDates.map(d => d.getMonth() + 1));
+  const strongWeekdayEvidence = best.score.compared >= 5 && best.score.matched / best.score.compared >= 0.8 && best.score.matched > originalScore.matched;
+  const sequentialDays = dateCols.every((item, i) => localDate(item.date)?.getDate() === i + 1);
+  const fileNameEvidence = Boolean(fileHint) && originalMonths.size === 1 && !originalMonths.has(hint.month) && sequentialDays;
+  if (!strongWeekdayEvidence && !fileNameEvidence) return {dateCols, correction: null};
+
+  return {
+    dateCols: best.mapped,
+    correction: {
+      from: dateCols[0].date.slice(0,7),
+      to: `${best.year}-${String(hint.month).padStart(2,"0")}`,
+      reason: fileHint ? "dosya adı ve haftanın günleri" : "sayfa adı ve haftanın günleri"
+    }
+  };
+}
 function workbookToDataset(sheets, sourceFile) {
   const scheduleCandidates = sheets.map(sheet => {
     const header = detectHeader(sheet.rows, [["sicil","personelno"],["adisoyadi","calisaninadi","personeladi"]]);
@@ -281,6 +377,9 @@ function workbookToDataset(sheets, sourceFile) {
     return numericRatio < 0.65;
   });
   if (!dateCols.length) throw new Error("Vardiya günü olarak kullanılabilecek tarih sütunu bulunamadı.");
+  const correctedDates = correctDateColumns(dateCols, sheet, header, sourceFile);
+  dateCols = correctedDates.dateCols;
+  const dateCorrection = correctedDates.correction;
   const byId = new Map();
   for (let r=header.index+1; r<sheet.rows.length; r++) {
     const row = sheet.rows[r] || [];
@@ -329,7 +428,8 @@ function workbookToDataset(sheets, sourceFile) {
     sheet: sheet.name,
     dates: dateCols.map(x=>x.date).sort(),
     people: Array.from(byId.values()).sort((a,b)=>a.name.localeCompare(b.name,"tr")),
-    importedAt: new Date().toISOString()
+    importedAt: new Date().toISOString(),
+    dateCorrection
   };
 }
 
@@ -339,8 +439,9 @@ async function importFile(file) {
   try {
     const dataset = await parseXlsx(file);
     loadDataset(dataset, true);
-    setParseStatus(`${dataset.people.length} personel ve ${dataset.dates.length} gün başarıyla okundu.`, false);
-    toast("Excel başarıyla içe aktarıldı.");
+    const correctionText = dataset.dateCorrection ? ` Tarihler ${dataset.dateCorrection.to.replace("-", ".")} ayına otomatik düzeltildi.` : "";
+    setParseStatus(`${dataset.people.length} personel ve ${dataset.dates.length} gün başarıyla okundu.${correctionText}`, false);
+    toast(dataset.dateCorrection ? "Excel okundu; ay bilgisi otomatik düzeltildi." : "Excel başarıyla içe aktarıldı.");
   } catch (error) {
     console.error(error);
     setParseStatus(error.message || "Excel okunamadı.", false, true);
@@ -602,7 +703,7 @@ function bindEvents() {
 
 async function boot() {
   bindEvents();
-  if("serviceWorker" in navigator) navigator.serviceWorker.register("service-worker.js").catch(console.warn);
+  if("serviceWorker" in navigator) navigator.serviceWorker.register("service-worker.js?v=1.2.0").catch(console.warn);
   const saved=loadJson(STORAGE_KEY,null);
   if(saved?.people?.length && saved?.dates?.length) { try{loadDataset(saved,false);}catch{} }
   renderNotificationState();
