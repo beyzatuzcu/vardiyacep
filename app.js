@@ -1,8 +1,8 @@
 "use strict";
 
-const APP_VERSION = "1.3.0";
+const APP_VERSION = "1.4.0";
 const $ = (id) => document.getElementById(id);
-const STORAGE_KEY = "vardiyacep.dataset.v3";
+const STORAGE_KEY = "vardiyacep.dataset.v4";
 const PERSON_KEY = "vardiyacep.person.v1";
 const MAPPING_KEY = "vardiyacep.mapping.v1";
 const REMINDER_KEY = "vardiyacep.reminder.v1";
@@ -76,6 +76,20 @@ function initials(name) {
 }
 function slugify(value) {
   return normalizeText(value).replace(/[^a-z0-9]+/g,"-") || "vardiya";
+}
+function personBaseKey(person) {
+  return [person.id, person.role, person.team, person.unit].map(normalizeText).join("::");
+}
+function ensurePersonKeys(dataset) {
+  const used = new Set();
+  dataset.people.forEach((person, index) => {
+    let key = String(person.key || personBaseKey(person) || `${person.id || "personel"}::${index + 1}`);
+    const base = key;
+    let suffix = 2;
+    while (used.has(key)) key = `${base}::${suffix++}`;
+    person.key = key;
+    used.add(key);
+  });
 }
 
 function inferMapping(code) {
@@ -371,27 +385,33 @@ function workbookToDataset(sheets, sourceFile) {
     if (date) dateCols.push({index,date});
   });
   if (!dateCols.length) throw new Error("Tarih sütunları bulunamadı. Tarihlerin Excel tarihi olarak girildiğini kontrol edin.");
-  // Bazı kurum şablonlarında toplam saat sütununun başlığında yanlışlıkla tarih kalabiliyor.
-  // Personel hücrelerinin büyük çoğunluğu sayısalsa bu sütunu vardiya günü olarak alma.
-  dateCols = dateCols.filter(({index}) => {
-    const samples=[];
-    for (let r=header.index+1; r<sheet.rows.length && samples.length<250; r++) {
-      const row=sheet.rows[r] || [];
-      const name=String(row[nameCol] ?? "").trim();
-      const rawId=row[idCol];
-      const id=typeof rawId === "number" ? String(Math.trunc(rawId)) : String(rawId ?? "").trim();
-      const value=row[index];
-      if (name && /^\d+$/.test(id) && value !== undefined && value !== null && String(value).trim() !== "") samples.push(value);
-    }
-    if (samples.length < 10) return true;
-    const numericRatio=samples.filter(v => typeof v === "number" && Number.isFinite(v)).length / samples.length;
-    return numericRatio < 0.65;
-  });
+  // 1,2,3... şeklinde tam ve ardışık aylık tarih başlığı varsa tüm günleri koru.
+  // Bazı satırlarda son gün boş bırakılıp aynı hücreye toplam saat (48, 64 vb.) yazılabiliyor;
+  // bu nedenle yalnızca sütun genelindeki sayısal orana bakıp 31. günü silmemeliyiz.
+  const rawHeaderDays = dateCols.map(item => localDate(item.date)?.getDate());
+  const isSequentialMonthlyHeader = rawHeaderDays.length >= 28 && rawHeaderDays[0] === 1 && rawHeaderDays.every((day, i) => day === i + 1);
+  if (!isSequentialMonthlyHeader) {
+    // Ardışık bir aylık başlık değilse, yanlışlıkla tarih başlığı kalmış toplam sütunlarını ele.
+    dateCols = dateCols.filter(({index}) => {
+      const samples=[];
+      for (let r=header.index+1; r<sheet.rows.length && samples.length<250; r++) {
+        const row=sheet.rows[r] || [];
+        const name=String(row[nameCol] ?? "").trim();
+        const rawId=row[idCol];
+        const id=typeof rawId === "number" ? String(Math.trunc(rawId)) : String(rawId ?? "").trim();
+        const value=row[index];
+        if (name && /^\d+$/.test(id) && value !== undefined && value !== null && String(value).trim() !== "") samples.push(value);
+      }
+      if (samples.length < 10) return true;
+      const numericRatio=samples.filter(v => typeof v === "number" && Number.isFinite(v)).length / samples.length;
+      return numericRatio < 0.65;
+    });
+  }
   if (!dateCols.length) throw new Error("Vardiya günü olarak kullanılabilecek tarih sütunu bulunamadı.");
   const correctedDates = correctDateColumns(dateCols, sheet, header, sourceFile);
   dateCols = correctedDates.dateCols;
   const dateCorrection = correctedDates.correction;
-  const byId = new Map();
+  const byKey = new Map();
   for (let r=header.index+1; r<sheet.rows.length; r++) {
     const row = sheet.rows[r] || [];
     const name = String(row[nameCol] ?? "").trim();
@@ -401,8 +421,10 @@ function workbookToDataset(sheets, sourceFile) {
     const shifts={}; let filled=0;
     dateCols.forEach(({index,date}) => {
       const raw = row[index];
-      if (raw !== undefined && raw !== null && String(raw).trim() !== "") {
-        shifts[date] = String(raw).trim(); filled++;
+      const code = String(raw ?? "").trim();
+      // Tarih hücresine kayan toplam saat (48, 64 vb.) değerlerini vardiya kodu sayma.
+      if (raw !== undefined && raw !== null && typeof raw !== "number" && code !== "") {
+        shifts[date] = code; filled++;
       }
     });
     if (filled < Math.min(3, dateCols.length)) continue;
@@ -414,10 +436,11 @@ function workbookToDataset(sheets, sourceFile) {
       unit: unitCol >= 0 ? String(row[unitCol] ?? "").trim() : "",
       shifts
     };
-    const old = byId.get(id);
-    if (!old || Object.keys(person.shifts).length >= Object.keys(old.shifts).length) byId.set(id, person);
+    person.key = personBaseKey(person);
+    const old = byKey.get(person.key);
+    if (!old || Object.keys(person.shifts).length >= Object.keys(old.shifts).length) byKey.set(person.key, person);
   }
-  if (!byId.size) throw new Error("Personel vardiya satırları bulunamadı.");
+  if (!byKey.size) throw new Error("Personel vardiya satırları bulunamadı.");
 
   for (const extra of sheets) {
     const leaveHeader = detectHeader(extra.rows, [["personelno","sicil"],["calisaninadi","adisoyadi"],["kalanizin"]]);
@@ -429,8 +452,9 @@ function workbookToDataset(sheets, sourceFile) {
     for (let r=leaveHeader.index+1; r<extra.rows.length; r++) {
       const row=extra.rows[r] || [];
       const raw=row[lid]; const id=typeof raw === "number" ? String(Math.trunc(raw)) : String(raw ?? "").trim();
-      if (!byId.has(id)) continue;
-      byId.get(id).leave={remaining: row[remaining] ?? null, used: used >= 0 ? row[used] ?? null : null};
+      const matches = Array.from(byKey.values()).filter(person => person.id === id);
+      if (!matches.length) continue;
+      matches.forEach(person => { person.leave={remaining: row[remaining] ?? null, used: used >= 0 ? row[used] ?? null : null}; });
     }
   }
 
@@ -438,7 +462,7 @@ function workbookToDataset(sheets, sourceFile) {
     sourceFile,
     sheet: sheet.name,
     dates: dateCols.map(x=>x.date).sort(),
-    people: Array.from(byId.values()).sort((a,b)=>a.name.localeCompare(b.name,"tr")),
+    people: Array.from(byKey.values()).sort((a,b)=>a.name.localeCompare(b.name,"tr") || a.team.localeCompare(b.team,"tr") || a.role.localeCompare(b.role,"tr")),
     importedAt: new Date().toISOString(),
     dateCorrection,
     appVersion: APP_VERSION
@@ -467,10 +491,12 @@ function setParseStatus(message, busy=false, error=false) {
 function loadDataset(dataset, persist=false) {
   if (!dataset?.people?.length || !dataset?.dates?.length) throw new Error("Veri kümesi eksik.");
   state.dataset=dataset;
+  ensurePersonKeys(dataset);
   ensureMappings(dataset);
   if (persist) saveJson(STORAGE_KEY,dataset);
-  const savedId=localStorage.getItem(PERSON_KEY);
-  state.selectedId=dataset.people.some(p=>p.id===savedId) ? savedId : dataset.people[0].id;
+  const savedKey=localStorage.getItem(PERSON_KEY);
+  const savedPerson=dataset.people.find(p=>p.key===savedKey) || dataset.people.find(p=>p.id===savedKey);
+  state.selectedId=savedPerson?.key || dataset.people[0].key;
   state.calendarCursor=localDate(dataset.dates[0]);
   $("importPanel").classList.add("hidden");
   $("appPanel").classList.remove("hidden");
@@ -485,10 +511,10 @@ function clearDataset() {
   $("fileInput").value=""; $("parseStatus").classList.add("hidden");
   toast("Kayıtlı vardiya verileri silindi.");
 }
-function selectedPerson() { return state.dataset?.people.find(p=>p.id===state.selectedId) || null; }
-function setSelectedPerson(id) {
-  if (!state.dataset?.people.some(p=>p.id===id)) return;
-  state.selectedId=id; localStorage.setItem(PERSON_KEY,id);
+function selectedPerson() { return state.dataset?.people.find(p=>p.key===state.selectedId) || null; }
+function setSelectedPerson(key) {
+  if (!state.dataset?.people.some(p=>p.key===key)) return;
+  state.selectedId=key; localStorage.setItem(PERSON_KEY,key);
   $("personResults").classList.add("hidden"); $("personSearch").value="";
   renderAll(); scheduleReminderCheck(); syncServiceWorker();
 }
@@ -504,8 +530,8 @@ function renderSelectedPerson() {
 function renderPersonSearch(query="") {
   if (!state.dataset) return;
   const q=normalizeText(query);
-  const list=state.dataset.people.filter(p => !q || normalizeText(`${p.name} ${p.id} ${p.team} ${p.role}`).includes(q)).slice(0,40);
-  $("personResults").innerHTML=list.map(p=>`<button class="search-item" type="button" data-person="${esc(p.id)}"><span><strong>${esc(p.name)}</strong><small>Sicil ${esc(p.id)}${p.role?` • ${esc(p.role)}`:""}</small></span>${p.team?`<span class="team-pill">${esc(p.team)}</span>`:""}</button>`).join("") || `<div class="empty-state">Eşleşen personel bulunamadı.</div>`;
+  const list=state.dataset.people.filter(p => !q || normalizeText(`${p.name} ${p.id} ${p.team} ${p.role} ${p.unit}`).includes(q)).slice(0,40);
+  $("personResults").innerHTML=list.map(p=>`<button class="search-item" type="button" data-person="${esc(p.key)}"><span><strong>${esc(p.name)}</strong><small>${[`Sicil ${p.id}`,p.role,p.unit].filter(Boolean).map(esc).join(" • ")}</small></span>${p.team?`<span class="team-pill">${esc(p.team)}</span>`:""}</button>`).join("") || `<div class="empty-state">Eşleşen personel bulunamadı.</div>`;
   $("personResults").classList.remove("hidden");
   $("personResults").querySelectorAll("[data-person]").forEach(btn=>btn.addEventListener("click",()=>setSelectedPerson(btn.dataset.person)));
 }
@@ -666,7 +692,7 @@ function downloadIcs() {
   const events=[];
   for(const iso of state.dataset.dates) {
     const info=shiftInfo(p,iso); if(info.category==="none")continue;
-    const d=localDate(iso); const uid=`${p.id}-${iso}-${slugify(info.code)}@vardiyacep`;
+    const d=localDate(iso); const uid=`${slugify(p.key || p.id)}-${iso}-${slugify(info.code)}@vardiyacep`;
     let lines=["BEGIN:VEVENT",`UID:${uid}`,`DTSTAMP:${toIcsLocal(new Date(),"00:00")}`,`SUMMARY:${icsEscape(info.label+" ("+info.code+")")}`];
     if(info.start && ["morning","evening","night","other"].includes(info.category)) {
       const end=addDays(d,0); const [h,m]=info.start.split(":").map(Number); end.setHours(h+8,m,0,0);
@@ -716,7 +742,7 @@ function bindEvents() {
 async function boot() {
   bindEvents();
   // Eski Mart verisinin otomatik geri yüklenmesini engelle.
-  ["vardiyacep.dataset.v1", "vardiyacep.dataset.v2"].forEach(key => localStorage.removeItem(key));
+  ["vardiyacep.dataset.v1", "vardiyacep.dataset.v2", "vardiyacep.dataset.v3"].forEach(key => localStorage.removeItem(key));
   if("serviceWorker" in navigator) {
     try {
       const reg = await navigator.serviceWorker.register(`service-worker.js?v=${APP_VERSION}`, {updateViaCache:"none"});
