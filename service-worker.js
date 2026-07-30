@@ -1,10 +1,18 @@
-const CACHE="vardiyacep-v1.2.0";
-const APP_SHELL=["./","./index.html","./styles.css","./app.js?v=1.2.0","./manifest.webmanifest","./sample-data.json","./icons/icon-192.png","./icons/icon-512.png"];
+const CACHE="vardiyacep-v1.3.0";
+const APP_SHELL=["./","./index.html","./styles.css?v=1.3.0","./app.js?v=1.3.0","./manifest.webmanifest","./sample-data.json","./icons/icon-192.png","./icons/icon-512.png"];
 self.addEventListener("install",event=>event.waitUntil(caches.open(CACHE).then(c=>c.addAll(APP_SHELL)).then(()=>self.skipWaiting())));
 self.addEventListener("activate",event=>event.waitUntil(caches.keys().then(keys=>Promise.all(keys.filter(k=>k!==CACHE).map(k=>caches.delete(k)))).then(()=>self.clients.claim())));
 self.addEventListener("fetch",event=>{
   if(event.request.method!=="GET")return;
-  event.respondWith(caches.match(event.request).then(hit=>hit||fetch(event.request).then(response=>{const copy=response.clone();caches.open(CACHE).then(c=>c.put(event.request,copy));return response;}).catch(()=>caches.match("./index.html"))));
+  const url=new URL(event.request.url);
+  const isAppAsset=event.request.mode==="navigate" || /\.(?:js|css|html)$/.test(url.pathname);
+  if(isAppAsset){
+    event.respondWith(fetch(event.request,{cache:"no-store"}).then(response=>{
+      const copy=response.clone(); caches.open(CACHE).then(c=>c.put(event.request,copy)); return response;
+    }).catch(()=>caches.match(event.request).then(hit=>hit||caches.match("./index.html"))));
+    return;
+  }
+  event.respondWith(caches.match(event.request).then(hit=>hit||fetch(event.request).then(response=>{const copy=response.clone();caches.open(CACHE).then(c=>c.put(event.request,copy));return response;})));
 });
 function openDb(){return new Promise((resolve,reject)=>{const req=indexedDB.open("vardiyacep-sw",1);req.onupgradeneeded=()=>req.result.createObjectStore("store");req.onsuccess=()=>resolve(req.result);req.onerror=()=>reject(req.error);});}
 async function put(key,value){const db=await openDb();return new Promise((resolve,reject)=>{const tx=db.transaction("store","readwrite");tx.objectStore("store").put(value,key);tx.oncomplete=resolve;tx.onerror=()=>reject(tx.error);});}

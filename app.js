@@ -1,7 +1,8 @@
 "use strict";
 
+const APP_VERSION = "1.3.0";
 const $ = (id) => document.getElementById(id);
-const STORAGE_KEY = "vardiyacep.dataset.v2";
+const STORAGE_KEY = "vardiyacep.dataset.v3";
 const PERSON_KEY = "vardiyacep.person.v1";
 const MAPPING_KEY = "vardiyacep.mapping.v1";
 const REMINDER_KEY = "vardiyacep.reminder.v1";
@@ -291,18 +292,22 @@ function weekdayScore(dateCols, weekdayRow) {
   return {compared, matched};
 }
 function correctDateColumns(dateCols, sheet, header, sourceFile) {
+  // Ay bilgisini önce dosya adından, sonra sayfa adından ve üst başlık hücrelerinden bul.
+  // Kurumun şablonunda tarih hücreleri eski bir aydan kalabildiği için dosya adı güçlü kanıttır.
+  const topText = (sheet.rows || []).slice(0, 8).flat().filter(v => v !== undefined && v !== null).join(" ");
   const fileHint = detectMonthHint(sourceFile);
   const sheetHint = detectMonthHint(sheet.name);
-  const hint = fileHint || sheetHint;
+  const cellHint = detectMonthHint(topText);
+  const hint = fileHint || sheetHint || cellHint;
   if (!hint || !dateCols.length) return {dateCols, correction: null};
 
   const rawDates = dateCols.map(x => localDate(x.date)).filter(Boolean);
-  const rawYear = rawDates.length
-    ? rawDates.map(d => d.getFullYear()).sort((a,b) =>
-        rawDates.filter(x => x.getFullYear() === b).length - rawDates.filter(x => x.getFullYear() === a).length
-      )[0]
-    : new Date().getFullYear();
-  const explicitYear = detectYearHint(sourceFile, sheet.name);
+  if (!rawDates.length) return {dateCols, correction: null};
+
+  const rawYearCounts = new Map();
+  rawDates.forEach(d => rawYearCounts.set(d.getFullYear(), (rawYearCounts.get(d.getFullYear()) || 0) + 1));
+  const rawYear = [...rawYearCounts.entries()].sort((a,b) => b[1] - a[1])[0][0];
+  const explicitYear = detectYearHint(sourceFile, sheet.name, topText);
   const years = [...new Set([explicitYear, rawYear, rawYear - 1, rawYear + 1, new Date().getFullYear()].filter(Boolean))];
   const weekdayRow = header.index > 0 ? sheet.rows[header.index - 1] || [] : [];
   const originalScore = weekdayScore(dateCols, weekdayRow);
@@ -326,17 +331,23 @@ function correctDateColumns(dateCols, sheet, header, sourceFile) {
 
   if (!best) return {dateCols, correction: null};
   const originalMonths = new Set(rawDates.map(d => d.getMonth() + 1));
+  const days = rawDates.map(d => d.getDate());
+  const startsAtOne = days[0] === 1;
+  const sequentialDays = startsAtOne && days.every((day, i) => day === i + 1);
+  const nonDecreasingDays = days.every((day, i) => i === 0 || day >= days[i-1]);
+  const monthMismatch = originalMonths.size === 1 && !originalMonths.has(hint.month);
   const strongWeekdayEvidence = best.score.compared >= 5 && best.score.matched / best.score.compared >= 0.8 && best.score.matched > originalScore.matched;
-  const sequentialDays = dateCols.every((item, i) => localDate(item.date)?.getDate() === i + 1);
-  const fileNameEvidence = Boolean(fileHint) && originalMonths.size === 1 && !originalMonths.has(hint.month) && sequentialDays;
-  if (!strongWeekdayEvidence && !fileNameEvidence) return {dateCols, correction: null};
+  // Dosya adında ay açıkça yazıyorsa ve sütunlar 1,2,3... şeklindeyse, eski Excel ayını kesin olarak düzelt.
+  const strongFileNameEvidence = Boolean(fileHint) && monthMismatch && sequentialDays;
+  const supportingHintEvidence = Boolean(sheetHint || cellHint) && monthMismatch && nonDecreasingDays && best.score.matched >= originalScore.matched;
+  if (!strongWeekdayEvidence && !strongFileNameEvidence && !supportingHintEvidence) return {dateCols, correction: null};
 
   return {
     dateCols: best.mapped,
     correction: {
       from: dateCols[0].date.slice(0,7),
       to: `${best.year}-${String(hint.month).padStart(2,"0")}`,
-      reason: fileHint ? "dosya adı ve haftanın günleri" : "sayfa adı ve haftanın günleri"
+      reason: fileHint ? "dosya adındaki ay" : sheetHint ? "sayfa adındaki ay" : "Excel başlığındaki ay"
     }
   };
 }
@@ -429,7 +440,8 @@ function workbookToDataset(sheets, sourceFile) {
     dates: dateCols.map(x=>x.date).sort(),
     people: Array.from(byId.values()).sort((a,b)=>a.name.localeCompare(b.name,"tr")),
     importedAt: new Date().toISOString(),
-    dateCorrection
+    dateCorrection,
+    appVersion: APP_VERSION
   };
 }
 
@@ -439,7 +451,7 @@ async function importFile(file) {
   try {
     const dataset = await parseXlsx(file);
     loadDataset(dataset, true);
-    const correctionText = dataset.dateCorrection ? ` Tarihler ${dataset.dateCorrection.to.replace("-", ".")} ayına otomatik düzeltildi.` : "";
+    const correctionText = dataset.dateCorrection ? ` Tarihler ${dataset.dateCorrection.to.slice(5,7)}.${dataset.dateCorrection.to.slice(0,4)} ayına otomatik düzeltildi.` : "";
     setParseStatus(`${dataset.people.length} personel ve ${dataset.dates.length} gün başarıyla okundu.${correctionText}`, false);
     toast(dataset.dateCorrection ? "Excel okundu; ay bilgisi otomatik düzeltildi." : "Excel başarıyla içe aktarıldı.");
   } catch (error) {
@@ -703,9 +715,16 @@ function bindEvents() {
 
 async function boot() {
   bindEvents();
-  if("serviceWorker" in navigator) navigator.serviceWorker.register("service-worker.js?v=1.2.0").catch(console.warn);
+  // Eski Mart verisinin otomatik geri yüklenmesini engelle.
+  ["vardiyacep.dataset.v1", "vardiyacep.dataset.v2"].forEach(key => localStorage.removeItem(key));
+  if("serviceWorker" in navigator) {
+    try {
+      const reg = await navigator.serviceWorker.register(`service-worker.js?v=${APP_VERSION}`, {updateViaCache:"none"});
+      reg.update().catch(()=>{});
+    } catch (error) { console.warn(error); }
+  }
   const saved=loadJson(STORAGE_KEY,null);
-  if(saved?.people?.length && saved?.dates?.length) { try{loadDataset(saved,false);}catch{} }
+  if(saved?.people?.length && saved?.dates?.length && saved.appVersion===APP_VERSION) { try{loadDataset(saved,false);}catch{} }
   renderNotificationState();
 }
 document.addEventListener("DOMContentLoaded",boot);
