@@ -12,7 +12,7 @@
   <meta name="mobile-web-app-capable" content="yes" />
   <link rel="icon" href="icons/icon-192.png" />
   <link rel="apple-touch-icon" href="icons/icon-192.png" />
-  <link rel="stylesheet" href="styles.css?v=1.5.0" />
+  <link rel="stylesheet" href="styles.css?v=1.7.0" />
   <title>VardiyaCep</title>
 </head>
 <body>
@@ -34,7 +34,7 @@
       <div class="hero-copy">
         <span class="eyebrow">Excel → Mobil Takvim</span>
         <h2>Aylık çalışma listesini saniyeler içinde kişisel vardiya ekranına çevir.</h2>
-        <p>Dosya yalnızca bu cihazda işlenir. Sunucuya gönderilmez.</p>
+        <p>Dosya yalnızca bu cihazda işlenir. Yeni ay yüklediğinizde önceki aylar silinmez; takvime eklenir.</p>
       </div>
       <div class="import-actions">
         <label class="button primary file-button">
@@ -64,7 +64,7 @@
             <small id="selectedMeta">—</small>
           </div>
         </div>
-        <button id="changeFileBtn" class="button ghost compact" type="button">Dosyayı değiştir</button>
+        <button id="changeFileBtn" class="button ghost compact" type="button">Ay / Excel ekle</button>
       </div>
 
       <nav class="tabs card" aria-label="Uygulama bölümleri">
@@ -111,11 +111,12 @@
           <div class="section-heading calendar-heading">
             <button id="prevMonthBtn" class="icon-button" type="button" aria-label="Önceki ay">‹</button>
             <div>
-              <span class="eyebrow">Aylık görünüm</span>
+              <span id="calendarMode" class="eyebrow">Aylık görünüm</span>
               <h3 id="calendarMonth">—</h3>
             </div>
             <button id="nextMonthBtn" class="icon-button" type="button" aria-label="Sonraki ay">›</button>
           </div>
+          <div id="predictionNotice" class="status-box hidden"></div>
           <div class="weekday-row" aria-hidden="true">
             <span>Pzt</span><span>Sal</span><span>Çar</span><span>Per</span><span>Cum</span><span>Cmt</span><span>Paz</span>
           </div>
@@ -129,7 +130,7 @@
           <article class="card section-card">
             <span class="eyebrow">Bildirim</span>
             <h3>“Yarın sabahçısın” hatırlatıcısı</h3>
-            <p class="muted">Seçili personelin ertesi gün vardiyasını belirlediğiniz saatte bildirir.</p>
+            <p class="muted">Seçili personelin ertesi gün vardiyasını belirlediğiniz saatte bildirir. Yeni ay Excel’i henüz gelmediyse tahmini program kullanılır ve bildirimde bunun tahmin olduğu açıkça belirtilir.</p>
             <div class="field inline-field">
               <label for="reminderTime">Bir gün önce</label>
               <input id="reminderTime" type="time" value="20:00" />
@@ -177,10 +178,10 @@
   </main>
 
   <footer>
-    <span>VardiyaCep <strong>v1.5</strong></span>
+    <span>VardiyaCep <strong>v1.7</strong></span>
     <span>Excel verisi cihazınızdan çıkmaz.</span>
   </footer>
 
-  <script src="app.js?v=1.5.0" defer></script>
+  <script src="app.js?v=1.7.0" defer></script>
 </body>
 </html>

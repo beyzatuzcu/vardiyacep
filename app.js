@@ -1,8 +1,9 @@
 "use strict";
 
-const APP_VERSION = "1.5.0";
+const APP_VERSION = "1.7.0";
 const $ = (id) => document.getElementById(id);
-const STORAGE_KEY = "vardiyacep.dataset.v5";
+const STORAGE_KEY = "vardiyacep.dataset.v6";
+const LEGACY_STORAGE_KEYS = ["vardiyacep.dataset.v5", "vardiyacep.dataset.v4", "vardiyacep.dataset.v3", "vardiyacep.dataset.v2", "vardiyacep.dataset.v1"];
 const PERSON_KEY = "vardiyacep.person.v1";
 const MAPPING_KEY = "vardiyacep.mapping.v1";
 const REMINDER_KEY = "vardiyacep.reminder.v1";
@@ -22,7 +23,8 @@ const state = {
   mappings: loadJson(MAPPING_KEY, {}),
   calendarCursor: null,
   deferredInstall: null,
-  notificationTimer: null
+  notificationTimer: null,
+  predictionCache: new Map()
 };
 
 function loadJson(key, fallback) {
@@ -507,15 +509,65 @@ function workbookToDataset(sheets, sourceFile) {
   };
 }
 
+function datasetSourceEntries(dataset) {
+  if (Array.isArray(dataset?.sources) && dataset.sources.length) return dataset.sources;
+  if (!dataset?.sourceFile) return [];
+  return [{
+    sourceFile: dataset.sourceFile,
+    sheet: dataset.sheet || "",
+    firstDate: dataset.dates?.[0] || null,
+    lastDate: dataset.dates?.at?.(-1) || null,
+    importedAt: dataset.importedAt || null
+  }];
+}
+function mergeDatasets(existing, incoming) {
+  if (!existing?.people?.length || !existing?.dates?.length) return {...incoming, appVersion: APP_VERSION, sources: datasetSourceEntries(incoming)};
+  ensurePersonKeys(existing);
+  ensurePersonKeys(incoming);
+  const people = new Map();
+  existing.people.forEach(person => people.set(person.key, {...person, shifts: {...(person.shifts || {})}}));
+  incoming.people.forEach(person => {
+    const old = people.get(person.key);
+    if (!old) {
+      people.set(person.key, {...person, shifts: {...(person.shifts || {})}});
+      return;
+    }
+    people.set(person.key, {
+      ...old,
+      ...person,
+      shifts: {...(old.shifts || {}), ...(person.shifts || {})},
+      // Yeni Excel'de YILLIK İZİNLER sayfası yoksa önceki kalan izin bilgisini koru.
+      leave: person.leave ?? old.leave
+    });
+  });
+  const sourceMap = new Map();
+  [...datasetSourceEntries(existing), ...datasetSourceEntries(incoming)].forEach(item => {
+    const key = `${item.firstDate || ""}::${item.lastDate || ""}::${item.sourceFile || ""}`;
+    sourceMap.set(key, item);
+  });
+  return {
+    ...existing,
+    sourceFile: incoming.sourceFile || existing.sourceFile,
+    sheet: incoming.sheet || existing.sheet,
+    dates: Array.from(new Set([...(existing.dates || []), ...(incoming.dates || [])])).sort(),
+    people: Array.from(people.values()).sort((a,b)=>a.name.localeCompare(b.name,"tr") || a.team.localeCompare(b.team,"tr") || a.role.localeCompare(b.role,"tr")),
+    importedAt: incoming.importedAt || new Date().toISOString(),
+    dateCorrection: incoming.dateCorrection || null,
+    sources: Array.from(sourceMap.values()),
+    appVersion: APP_VERSION
+  };
+}
 async function importFile(file) {
   if (!file || !file.name.toLowerCase().endsWith(".xlsx")) { toast("Lütfen .xlsx uzantılı Excel dosyası seçin."); return; }
-  setParseStatus("Excel okunuyor ve personel programları hazırlanıyor…", true);
+  setParseStatus("Excel okunuyor ve mevcut aylara ekleniyor…", true);
   try {
-    const dataset = await parseXlsx(file);
-    loadDataset(dataset, true);
-    const correctionText = dataset.dateCorrection ? ` Tarihler ${dataset.dateCorrection.to.slice(5,7)}.${dataset.dateCorrection.to.slice(0,4)} ayına otomatik düzeltildi.` : "";
-    setParseStatus(`${dataset.people.length} personel ve ${dataset.dates.length} gün başarıyla okundu.${correctionText}`, false);
-    toast(dataset.dateCorrection ? "Excel okundu; ay bilgisi otomatik düzeltildi." : "Excel başarıyla içe aktarıldı.");
+    const imported = await parseXlsx(file);
+    const dataset = mergeDatasets(state.dataset, imported);
+    loadDataset(dataset, true, imported.dates[0]);
+    const correctionText = imported.dateCorrection ? ` Tarihler ${imported.dateCorrection.to.slice(5,7)}.${imported.dateCorrection.to.slice(0,4)} ayına otomatik düzeltildi.` : "";
+    const monthCount = new Set(dataset.dates.map(d => d.slice(0,7))).size;
+    setParseStatus(`${imported.people.length} personel ve ${imported.dates.length} gün okundu. Toplam ${monthCount} ay cihazda saklanıyor.${correctionText}`, false);
+    toast(monthCount > 1 ? "Yeni ay eklendi; önceki aylar korundu." : (imported.dateCorrection ? "Excel okundu; ay bilgisi otomatik düzeltildi." : "Excel başarıyla içe aktarıldı."));
   } catch (error) {
     console.error(error);
     setParseStatus(error.message || "Excel okunamadı.", false, true);
@@ -526,16 +578,32 @@ function setParseStatus(message, busy=false, error=false) {
   el.style.background = error ? "#fff1f0" : busy ? "#fef3c7" : "#edf5f3";
   el.style.color = error ? "#b42318" : "#0b5d57";
 }
-function loadDataset(dataset, persist=false) {
+function chooseCalendarCursor(dataset, focusDate=null) {
+  if (focusDate) {
+    const d=localDate(focusDate);
+    if (d) return new Date(d.getFullYear(),d.getMonth(),1);
+  }
+  const todayPrefix=isoLocal(new Date()).slice(0,7);
+  const current=dataset.dates.find(d=>d.startsWith(todayPrefix));
+  if (current) { const d=localDate(current); return new Date(d.getFullYear(),d.getMonth(),1); }
+  const latest=localDate(dataset.dates.at(-1));
+  const latestMonthStart=new Date(latest.getFullYear(),latest.getMonth(),1);
+  const nextMonthStart=new Date(latest.getFullYear(),latest.getMonth()+1,1);
+  const today=new Date(); const todayMonthStart=new Date(today.getFullYear(),today.getMonth(),1);
+  if(todayMonthStart.getTime()===nextMonthStart.getTime()) return todayMonthStart;
+  return latestMonthStart;
+}
+function loadDataset(dataset, persist=false, focusDate=null) {
   if (!dataset?.people?.length || !dataset?.dates?.length) throw new Error("Veri kümesi eksik.");
   state.dataset=dataset;
+  state.predictionCache.clear();
   ensurePersonKeys(dataset);
   ensureMappings(dataset);
   if (persist) saveJson(STORAGE_KEY,dataset);
   const savedKey=localStorage.getItem(PERSON_KEY);
   const savedPerson=dataset.people.find(p=>p.key===savedKey) || dataset.people.find(p=>p.id===savedKey);
   state.selectedId=savedPerson?.key || dataset.people[0].key;
-  state.calendarCursor=localDate(dataset.dates[0]);
+  state.calendarCursor=chooseCalendarCursor(dataset,focusDate);
   $("importPanel").classList.add("hidden");
   $("appPanel").classList.remove("hidden");
   renderAll();
@@ -543,8 +611,8 @@ function loadDataset(dataset, persist=false) {
   syncServiceWorker();
 }
 function clearDataset() {
-  localStorage.removeItem(STORAGE_KEY); localStorage.removeItem(PERSON_KEY);
-  state.dataset=null; state.selectedId=null;
+  [STORAGE_KEY, ...LEGACY_STORAGE_KEYS].forEach(key=>localStorage.removeItem(key)); localStorage.removeItem(PERSON_KEY);
+  state.dataset=null; state.selectedId=null; state.predictionCache.clear();
   $("appPanel").classList.add("hidden"); $("importPanel").classList.remove("hidden");
   $("fileInput").value=""; $("parseStatus").classList.add("hidden");
   toast("Kayıtlı vardiya verileri silindi.");
@@ -573,15 +641,109 @@ function renderPersonSearch(query="") {
   $("personResults").classList.remove("hidden");
   $("personResults").querySelectorAll("[data-person]").forEach(btn=>btn.addEventListener("click",()=>setSelectedPerson(btn.dataset.person)));
 }
-function shiftInfo(person, iso) {
-  const code=person?.shifts?.[iso];
-  if (!code) return {code:"—", category:"none", label:"Program yok", short:"Yok", start:"", className:"neutral"};
-  const map=getMapping(code); const base=CATEGORY_INFO[map.category] || CATEGORY_INFO.other;
-  return {code, category:map.category, label:map.label || base.label, short:base.short, start:map.start || "", className:base.className};
+function monthKey(date) {
+  return `${date.getFullYear()}-${String(date.getMonth()+1).padStart(2,"0")}`;
 }
-function statsFor(person) {
+function nextMonthKey(key) {
+  const [y,m]=String(key).split("-").map(Number);
+  return monthKey(new Date(y,m,1));
+}
+function monthDateKeys(key) {
+  const [y,m]=String(key).split("-").map(Number);
+  const last=new Date(y,m,0).getDate();
+  return Array.from({length:last},(_,i)=>`${y}-${String(m).padStart(2,"0")}-${String(i+1).padStart(2,"0")}`);
+}
+function dayDiff(a,b) {
+  const ms=Date.UTC(b.getFullYear(),b.getMonth(),b.getDate())-Date.UTC(a.getFullYear(),a.getMonth(),a.getDate());
+  return Math.round(ms/86400000);
+}
+function predictionModel(person) {
+  if(!person || !state.dataset) return null;
+  const cacheKey=`${person.key || person.id}::${state.dataset.importedAt || ""}::${Object.keys(state.mappings).length}`;
+  if(state.predictionCache.has(cacheKey)) return state.predictionCache.get(cacheKey);
+  const entries=Object.entries(person.shifts || {}).filter(([iso,code])=>/^\d{4}-\d{2}-\d{2}$/.test(iso) && String(code||"").trim()).sort((a,b)=>a[0].localeCompare(b[0]));
+  const monthCounts=new Map();
+  entries.forEach(([iso])=>monthCounts.set(iso.slice(0,7),(monthCounts.get(iso.slice(0,7))||0)+1));
+  const completeMonths=Array.from(monthCounts.entries()).filter(([,count])=>count>=20).map(([key])=>key).sort();
+  if(completeMonths.length<2) { state.predictionCache.set(cacheKey,null); return null; }
+  const sourceMonths=completeMonths.slice(-2);
+  const [y1,m1]=sourceMonths[0].split("-").map(Number), [y2,m2]=sourceMonths[1].split("-").map(Number);
+  const expectedSecond=monthKey(new Date(y1,m1,1));
+  if(expectedSecond!==sourceMonths[1]) { state.predictionCache.set(cacheKey,null); return null; }
+  const sourceEntries=entries.filter(([iso])=>sourceMonths.includes(iso.slice(0,7)));
+  const firstDate=localDate(sourceEntries[0]?.[0]);
+  const lastDate=localDate(sourceEntries.at(-1)?.[0]);
+  if(!firstDate || !lastDate) { state.predictionCache.set(cacheKey,null); return null; }
+  const totalDays=dayDiff(firstDate,lastDate)+1;
+  const byOffset=new Map();
+  sourceEntries.forEach(([iso,code])=>{
+    const d=localDate(iso); const info=getMapping(code);
+    if(!d || !["morning","evening","night","off"].includes(info.category)) return;
+    byOffset.set(dayDiff(firstDate,d),{code:String(code).trim(),category:info.category});
+  });
+  let best=null;
+  for(let cycle=2;cycle<=16;cycle++) {
+    let compared=0, matched=0;
+    for(let i=cycle;i<totalDays;i++) {
+      const a=byOffset.get(i), b=byOffset.get(i-cycle);
+      if(!a || !b) continue;
+      compared++; if(a.category===b.category) matched++;
+    }
+    if(compared<14) continue;
+    const ratio=matched/compared;
+    if(!best || ratio>best.ratio+0.0001 || (Math.abs(ratio-best.ratio)<0.0001 && cycle<best.cycle)) best={cycle,ratio,compared};
+  }
+  if(!best || best.ratio<0.72) { state.predictionCache.set(cacheKey,null); return null; }
+  const slotVotes=Array.from({length:best.cycle},()=>new Map());
+  byOffset.forEach((item,offset)=>{
+    const slot=((offset%best.cycle)+best.cycle)%best.cycle;
+    const key=`${item.category}::${item.code}`;
+    slotVotes[slot].set(key,(slotVotes[slot].get(key)||0)+1);
+  });
+  const slotCodes=slotVotes.map(votes=>{
+    const sorted=Array.from(votes.entries()).sort((a,b)=>b[1]-a[1]);
+    return sorted[0]?.[0]?.split("::").slice(1).join("::") || null;
+  });
+  if(slotCodes.some(code=>!code)) { state.predictionCache.set(cacheKey,null); return null; }
+  const latestMonth=sourceMonths[1];
+  const model={sourceMonths,targetMonth:nextMonthKey(latestMonth),firstDate,lastDate,cycle:best.cycle,confidence:Math.round(best.ratio*100),slotCodes};
+  state.predictionCache.set(cacheKey,model);
+  return model;
+}
+function predictedShift(person,iso) {
+  if(person?.shifts?.[iso]) return null;
+  const model=predictionModel(person);
+  if(!model || iso.slice(0,7)!==model.targetMonth) return null;
+  const d=localDate(iso);
+  if(!d || d<=model.lastDate) return null;
+  const offset=dayDiff(model.firstDate,d);
+  const slot=((offset%model.cycle)+model.cycle)%model.cycle;
+  const code=model.slotCodes[slot];
+  return code ? {code,confidence:model.confidence,cycle:model.cycle,sourceMonths:model.sourceMonths,targetMonth:model.targetMonth} : null;
+}
+function predictionDates(person) {
+  const model=predictionModel(person);
+  return model ? monthDateKeys(model.targetMonth).filter(iso=>predictedShift(person,iso)) : [];
+}
+function shiftInfo(person, iso) {
+  let code=person?.shifts?.[iso];
+  let prediction=null;
+  if(!code) { prediction=predictedShift(person,iso); code=prediction?.code; }
+  if (!code) return {code:"—", category:"none", label:"Program yok", short:"Yok", start:"", className:"neutral", predicted:false};
+  const map=getMapping(code); const base=CATEGORY_INFO[map.category] || CATEGORY_INFO.other;
+  return {code, category:map.category, label:map.label || base.label, short:base.short, start:map.start || "", className:base.className, predicted:Boolean(prediction), prediction};
+}
+function datesForCalendarMonth() {
+  if(!state.calendarCursor) return state.dataset?.dates || [];
+  const prefix=`${state.calendarCursor.getFullYear()}-${String(state.calendarCursor.getMonth()+1).padStart(2,"0")}-`;
+  const actual=(state.dataset?.dates || []).filter(d=>d.startsWith(prefix));
+  if(actual.length) return actual;
+  const p=selectedPerson(); const model=predictionModel(p);
+  return model?.targetMonth===prefix.slice(0,7) ? predictionDates(p) : [];
+}
+function statsFor(person, dates=state.dataset.dates) {
   const result={work:0,off:0,annual:0,night:0};
-  state.dataset.dates.forEach(d=>{
+  dates.forEach(d=>{
     const info=shiftInfo(person,d);
     if (["morning","evening","night","other"].includes(info.category)) result.work++;
     if (info.category==="off") result.off++;
@@ -593,42 +755,56 @@ function statsFor(person) {
 function renderShiftCard(prefix,date,person) {
   const iso=isoLocal(date); const info=shiftInfo(person,iso);
   $(`${prefix}Date`).textContent=dateLabel(date);
-  const badge=$(`${prefix}Badge`); badge.textContent=info.code; badge.className=`shift-badge ${info.className}`;
-  $(`${prefix}Title`).textContent=info.category==="none" ? "Bu tarihte program yok" : info.label;
-  const detail=info.start ? `${info.start} başlangıç • Kod: ${info.code}` : info.category==="none" ? "Dosyanın tarih aralığı dışında olabilir." : `Kod: ${info.code}`;
+  const badge=$(`${prefix}Badge`); badge.textContent=info.predicted?`~${info.code}`:info.code; badge.className=`shift-badge ${info.className}`;
+  $(`${prefix}Title`).textContent=info.category==="none" ? "Bu tarihte program yok" : info.predicted ? `Tahmine göre ${info.label.toLocaleLowerCase("tr-TR")}` : info.label;
+  const predictionText=info.predicted ? `Tahmini program • %${info.prediction.confidence} örüntü uyumu • ` : "";
+  const detail=info.start ? `${predictionText}${info.start} başlangıç • Kod: ${info.code}` : info.category==="none" ? "Dosyanın tarih aralığı dışında olabilir." : `${predictionText}Kod: ${info.code}`;
   $(`${prefix}Detail`).textContent=detail;
 }
 function renderHome() {
   const p=selectedPerson(); if(!p)return;
   const today=new Date(); today.setHours(0,0,0,0);
   renderShiftCard("today",today,p); renderShiftCard("tomorrow",addDays(today,1),p);
-  const stats=statsFor(p);
+  const stats=statsFor(p,datesForCalendarMonth());
   const leave=p.leave?.remaining;
   const statItems=[
-    ["Çalışma günü",stats.work], ["İzin / dinlenme",stats.off], ["Yıllık izin günü",stats.annual], ["Kalan yıllık izin",leave ?? "—"]
+    ["Çalışma günü",stats.work], ["İzin / dinlenme",stats.off], ["Yıllık izin günü",stats.annual], ["Kalan yıllık izin",leave ?? "Excel'de yok"]
   ];
   $("statsGrid").innerHTML=statItems.map(([label,value])=>`<article class="stat card"><span>${esc(label)}</span><strong>${esc(value)}</strong></article>`).join("");
-  const start=state.dataset.dates.includes(isoLocal(today)) ? today : localDate(state.dataset.dates[0]);
+  const firstActual=localDate(state.dataset.dates[0]);
+  const start=today>=firstActual ? today : firstActual;
   const upcoming=[];
-  for(let i=0;i<7;i++) { const d=addDays(start,i); const iso=isoLocal(d); if(state.dataset.dates.includes(iso)) upcoming.push({d,info:shiftInfo(p,iso)}); }
+  for(let i=0;i<7;i++) { const d=addDays(start,i); const info=shiftInfo(p,isoLocal(d)); if(info.category!=="none") upcoming.push({d,info}); }
   $("upcomingList").className=upcoming.length?"schedule-list":"schedule-list empty-state";
-  $("upcomingList").innerHTML=upcoming.length?upcoming.map(({d,info})=>`<div class="schedule-row"><div class="date-box"><strong>${d.getDate()}</strong><small>${dateLabel(d,{weekday:"short"})}</small></div><div class="schedule-copy"><strong>${esc(info.label)}</strong><small>${info.start?`${esc(info.start)} başlangıç • `:""}${dateLabel(d,{day:"numeric",month:"long"})}</small></div><span class="code-pill ${esc(info.className)}">${esc(info.code)}</span></div>`).join(""):"Bu dosyada gösterilecek gün bulunamadı.";
+  $("upcomingList").innerHTML=upcoming.length?upcoming.map(({d,info})=>`<div class="schedule-row"><div class="date-box"><strong>${d.getDate()}</strong><small>${dateLabel(d,{weekday:"short"})}</small></div><div class="schedule-copy"><strong>${info.predicted?"Tahmini • ":""}${esc(info.label)}</strong><small>${info.start?`${esc(info.start)} başlangıç • `:""}${dateLabel(d,{day:"numeric",month:"long"})}${info.predicted?` • %${info.prediction.confidence}`:""}</small></div><span class="code-pill ${esc(info.className)}">${info.predicted?"~":""}${esc(info.code)}</span></div>`).join(""):"Bu tarihler için program veya yeterli tahmin verisi bulunamadı.";
 }
 function renderCalendar() {
   const p=selectedPerson(); if(!p || !state.calendarCursor)return;
   const year=state.calendarCursor.getFullYear(), month=state.calendarCursor.getMonth();
+  const currentMonthKey=monthKey(new Date(year,month,1));
+  const model=predictionModel(p);
+  const isPredictionMonth=model?.targetMonth===currentMonthKey && !(state.dataset?.dates || []).some(d=>d.startsWith(currentMonthKey));
   $("calendarMonth").textContent=dateLabel(new Date(year,month,1),{month:"long",year:"numeric"});
+  const mode=$("calendarMode");
+  if(mode) mode.textContent=isPredictionMonth ? `Tahmini görünüm • %${model.confidence} uyum` : "Aylık görünüm";
+  const notice=$("predictionNotice");
+  if(notice) {
+    notice.classList.toggle("hidden",!isPredictionMonth);
+    notice.textContent=isPredictionMonth ? `Bu ayın Excel'i henüz yüklenmedi. Program, önceki iki ayın tekrar eden vardiya düzeninden ${model.cycle} günlük döngü ile tahmin edildi. ~ işaretli günler tahminidir; Excel gelince gerçek program otomatik olarak bunun yerini alır.` : "";
+  }
   const first=new Date(year,month,1); const startOffset=(first.getDay()+6)%7;
   const gridStart=addDays(first,-startOffset); const todayIso=isoLocal(new Date());
   let html="";
   for(let i=0;i<42;i++) {
     const d=addDays(gridStart,i); const iso=isoLocal(d); const info=shiftInfo(p,iso); const outside=d.getMonth()!==month;
-    html+=`<div class="calendar-day${outside?" outside":""}${iso===todayIso?" today":""}" title="${esc(info.label)}"><span class="day-number">${d.getDate()}</span>${info.category!=="none"?`<div class="day-code ${esc(info.className)}">${esc(info.code)}</div><span class="day-label">${esc(info.short)}</span>`:""}</div>`;
+    const title=info.predicted?`Tahmini • %${info.prediction.confidence} • ${info.label}`:info.label;
+    html+=`<div class="calendar-day${outside?" outside":""}${iso===todayIso?" today":""}" title="${esc(title)}"><span class="day-number">${d.getDate()}</span>${info.category!=="none"?`<div class="day-code ${esc(info.className)}">${info.predicted?"~":""}${esc(info.code)}</div><span class="day-label">${info.predicted?"Tahmini ":""}${esc(info.short)}</span>`:""}</div>`;
   }
   $("calendarGrid").innerHTML=html;
   const categories=["morning","evening","night","off","annual","other"];
-  $("legend").innerHTML=categories.map(c=>`<span class="legend-item"><i class="legend-dot day-code ${c}"></i>${esc(CATEGORY_INFO[c].short)}</span>`).join("");
+  $("legend").innerHTML=categories.map(c=>`<span class="legend-item"><i class="legend-dot day-code ${c}"></i>${esc(CATEGORY_INFO[c].short)}</span>`).join("")+(isPredictionMonth?`<span class="legend-item"><strong>~</strong>Tahmini gün</span>`:"");
 }
+
 function renderMappings() {
   const p=selectedPerson(); if(!p)return;
   const codes=Array.from(new Set(Object.values(p.shifts||{}).map(String))).sort((a,b)=>a.localeCompare(b,"tr",{numeric:true}));
@@ -641,7 +817,7 @@ function renderMappings() {
     const save=()=>{
       const category=select.value, base=CATEGORY_INFO[category];
       state.mappings[code]={code,category,label:base.label,start:time.value || base.start};
-      saveJson(MAPPING_KEY,state.mappings); renderHome(); renderCalendar(); scheduleReminderCheck(); syncServiceWorker();
+      saveJson(MAPPING_KEY,state.mappings); state.predictionCache.clear(); renderHome(); renderCalendar(); scheduleReminderCheck(); syncServiceWorker();
     };
     select.addEventListener("change",()=>{ if(!time.value) time.value=CATEGORY_INFO[select.value].start; save(); });
     time.addEventListener("change",save);
@@ -649,8 +825,10 @@ function renderMappings() {
 }
 function renderDatasetSummary() {
   if(!state.dataset)return;
-  const start=localDate(state.dataset.dates[0]), end=localDate(state.dataset.dates.at(-1));
-  $("datasetSummary").textContent=`${state.dataset.sourceFile || "Excel"} • ${state.dataset.people.length} personel • ${dateLabel(start,{day:"numeric",month:"long",year:"numeric"})} – ${dateLabel(end,{day:"numeric",month:"long",year:"numeric"})}`;
+  const monthKeys=Array.from(new Set(state.dataset.dates.map(d=>d.slice(0,7)))).sort();
+  const monthLabels=monthKeys.map(key=>{ const [y,m]=key.split("-").map(Number); return dateLabel(new Date(y,m-1,1),{month:"long",year:"numeric"}); });
+  const sources=datasetSourceEntries(state.dataset);
+  $("datasetSummary").textContent=`${monthLabels.join(" + ")} • ${state.dataset.people.length} personel • ${sources.length || monthKeys.length} Excel/ay kayıtlı`;
 }
 function switchTab(name) {
   document.querySelectorAll(".tab").forEach(x=>x.classList.toggle("active",x.dataset.tab===name));
@@ -663,8 +841,9 @@ function reminderMessage(person,date) {
   const info=shiftInfo(person,isoLocal(date));
   if (info.category==="none") return null;
   const tomorrowWord=dateLabel(date,{weekday:"long"});
-  const title=info.category==="morning" ? "Yarın sabahçısın ☀️" : info.category==="evening" ? "Yarın akşam vardiyasındasın" : info.category==="night" ? "Yarın gece vardiyasındasın 🌙" : info.category==="off" ? "Yarın izinlisin" : info.category==="annual" ? "Yarın yıllık izindesin" : `Yarın: ${info.label}`;
-  const body=`${tomorrowWord} • ${info.start?info.start+" başlangıç • ":""}Kod: ${info.code}`;
+  const baseTitle=info.category==="morning" ? "Yarın sabahçısın ☀️" : info.category==="evening" ? "Yarın akşam vardiyasındasın" : info.category==="night" ? "Yarın gece vardiyasındasın 🌙" : info.category==="off" ? "Yarın izinlisin" : info.category==="annual" ? "Yarın yıllık izindesin" : `Yarın: ${info.label}`;
+  const title=info.predicted ? `Tahmine göre: ${baseTitle}` : baseTitle;
+  const body=`${info.predicted?`Tahmini program • %${info.prediction.confidence} • `:""}${tomorrowWord} • ${info.start?info.start+" başlangıç • ":""}Kod: ${info.code}`;
   return {title,body};
 }
 async function requestNotifications() {
@@ -712,7 +891,11 @@ async function syncServiceWorker() {
   try {
     const reg=await navigator.serviceWorker.ready;
     const settings=reminderSettings();
-    reg.active?.postMessage({type:"SAVE_REMINDER",payload:{person:selectedPerson(),mappings:state.mappings,settings}});
+    const person=selectedPerson();
+    const predicted={};
+    predictionDates(person).forEach(iso=>{ const item=predictedShift(person,iso); if(item) predicted[iso]=item.code; });
+    const reminderPerson={...person,shifts:{...(person.shifts||{}),...predicted}};
+    reg.active?.postMessage({type:"SAVE_REMINDER",payload:{person:reminderPerson,mappings:state.mappings,settings,predictedDates:Object.keys(predicted)}});
     if("periodicSync" in reg && settings.enabled) {
       try { await reg.periodicSync.register("vardiyacep-daily",{minInterval:12*60*60*1000}); } catch {}
     }
@@ -728,10 +911,11 @@ function downloadIcs() {
   const p=selectedPerson(); if(!p)return toast("Önce personel seçin.");
   const alarmTime=$("calendarReminderTime").value || "20:00";
   const events=[];
-  for(const iso of state.dataset.dates) {
+  const exportDates=Array.from(new Set([...(state.dataset.dates||[]),...predictionDates(p)])).sort();
+  for(const iso of exportDates) {
     const info=shiftInfo(p,iso); if(info.category==="none")continue;
     const d=localDate(iso); const uid=`${slugify(p.key || p.id)}-${iso}-${slugify(info.code)}@vardiyacep`;
-    let lines=["BEGIN:VEVENT",`UID:${uid}`,`DTSTAMP:${toIcsLocal(new Date(),"00:00")}`,`SUMMARY:${icsEscape(info.label+" ("+info.code+")")}`];
+    let lines=["BEGIN:VEVENT",`UID:${uid}`,`DTSTAMP:${toIcsLocal(new Date(),"00:00")}`,`SUMMARY:${icsEscape((info.predicted?"TAHMİN - ":"")+info.label+" ("+info.code+")")}`];
     if(info.start && ["morning","evening","night","other"].includes(info.category)) {
       const end=addDays(d,0); const [h,m]=info.start.split(":").map(Number); end.setHours(h+8,m,0,0);
       lines.push(`DTSTART:${toIcsLocal(d,info.start)}`,`DTEND:${toIcsLocal(end,`${String(end.getHours()).padStart(2,"0")}:${String(end.getMinutes()).padStart(2,"0")}`)}`);
@@ -739,7 +923,7 @@ function downloadIcs() {
       const next=addDays(d,1); lines.push(`DTSTART;VALUE=DATE:${iso.replaceAll("-","")}`,`DTEND;VALUE=DATE:${isoLocal(next).replaceAll("-","")}`);
     }
     const alarmDate=addDays(d,-1);
-    lines.push(`DESCRIPTION:${icsEscape(`${p.name} • Kod ${info.code}${info.start?" • "+info.start:""}`)}`,"BEGIN:VALARM",`TRIGGER;VALUE=DATE-TIME:${toIcsLocal(alarmDate,alarmTime)}`,"ACTION:DISPLAY",`DESCRIPTION:${icsEscape("Yarın: "+info.label+" ("+info.code+")")}`,"END:VALARM","END:VEVENT");
+    lines.push(`DESCRIPTION:${icsEscape(`${p.name} • ${info.predicted?"TAHMİN • Excel gelince doğrulayın • ":""}Kod ${info.code}${info.start?" • "+info.start:""}`)}`,"BEGIN:VALARM",`TRIGGER;VALUE=DATE-TIME:${toIcsLocal(alarmDate,alarmTime)}`,"ACTION:DISPLAY",`DESCRIPTION:${icsEscape((info.predicted?"Tahmine göre yarın: ":"Yarın: ")+info.label+" ("+info.code+")")}`,"END:VALARM","END:VEVENT");
     events.push(lines.join("\r\n"));
   }
   if(!events.length)return toast("Aktarılacak program bulunamadı.");
@@ -765,8 +949,8 @@ function bindEvents() {
   $("personSearch").addEventListener("focus",e=>renderPersonSearch(e.target.value));
   document.addEventListener("click",e=>{if(!e.target.closest(".field.grow"))$("personResults").classList.add("hidden");});
   document.querySelectorAll(".tab").forEach(btn=>btn.addEventListener("click",()=>switchTab(btn.dataset.tab)));
-  $("prevMonthBtn").addEventListener("click",()=>{state.calendarCursor=new Date(state.calendarCursor.getFullYear(),state.calendarCursor.getMonth()-1,1);renderCalendar();});
-  $("nextMonthBtn").addEventListener("click",()=>{state.calendarCursor=new Date(state.calendarCursor.getFullYear(),state.calendarCursor.getMonth()+1,1);renderCalendar();});
+  $("prevMonthBtn").addEventListener("click",()=>{state.calendarCursor=new Date(state.calendarCursor.getFullYear(),state.calendarCursor.getMonth()-1,1);renderCalendar();renderHome();});
+  $("nextMonthBtn").addEventListener("click",()=>{state.calendarCursor=new Date(state.calendarCursor.getFullYear(),state.calendarCursor.getMonth()+1,1);renderCalendar();renderHome();});
   $("enableNotificationsBtn").addEventListener("click",requestNotifications);
   $("testNotificationBtn").addEventListener("click",testNotification);
   $("reminderTime").addEventListener("change",e=>{const s=reminderSettings();s.time=e.target.value;s.enabled=Notification.permission==="granted";saveReminderSettings(s);renderNotificationState();scheduleReminderCheck();syncServiceWorker();});
@@ -779,16 +963,22 @@ function bindEvents() {
 
 async function boot() {
   bindEvents();
-  // Eski Mart verisinin otomatik geri yüklenmesini engelle.
-  ["vardiyacep.dataset.v1", "vardiyacep.dataset.v2", "vardiyacep.dataset.v3", "vardiyacep.dataset.v4"].forEach(key => localStorage.removeItem(key));
   if("serviceWorker" in navigator) {
     try {
       const reg = await navigator.serviceWorker.register(`service-worker.js?v=${APP_VERSION}`, {updateViaCache:"none"});
       reg.update().catch(()=>{});
     } catch (error) { console.warn(error); }
   }
-  const saved=loadJson(STORAGE_KEY,null);
-  if(saved?.people?.length && saved?.dates?.length && saved.appVersion===APP_VERSION) { try{loadDataset(saved,false);}catch{} }
+  let saved=loadJson(STORAGE_KEY,null);
+  if(!saved?.people?.length || !saved?.dates?.length) {
+    // Eski cihaz kaydını koru; v1.7 tahmin özelliği mevcut aylık verilerin üzerine çalışır.
+    const legacy=loadJson("vardiyacep.dataset.v5",null);
+    if(legacy?.people?.length && legacy?.dates?.length) {
+      saved={...legacy,appVersion:APP_VERSION,sources:datasetSourceEntries(legacy)};
+      saveJson(STORAGE_KEY,saved);
+    }
+  }
+  if(saved?.people?.length && saved?.dates?.length) { try{loadDataset({...saved,appVersion:APP_VERSION},false);}catch{} }
   renderNotificationState();
 }
 document.addEventListener("DOMContentLoaded",boot);
