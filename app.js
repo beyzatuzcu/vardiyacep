@@ -1,8 +1,8 @@
 "use strict";
 
-const APP_VERSION = "1.4.0";
+const APP_VERSION = "1.5.0";
 const $ = (id) => document.getElementById(id);
-const STORAGE_KEY = "vardiyacep.dataset.v4";
+const STORAGE_KEY = "vardiyacep.dataset.v5";
 const PERSON_KEY = "vardiyacep.person.v1";
 const MAPPING_KEY = "vardiyacep.mapping.v1";
 const REMINDER_KEY = "vardiyacep.reminder.v1";
@@ -305,9 +305,25 @@ function weekdayScore(dateCols, weekdayRow) {
   }
   return {compared, matched};
 }
+function alignedDateColumns(dateCols, row) {
+  if (!row || !dateCols.length) return null;
+  const mapped = dateCols.map(({index}) => {
+    const date = parseDateValue(row[index]);
+    return date ? {index, date} : null;
+  }).filter(Boolean);
+  if (mapped.length < 28) return null;
+  const parsed = mapped.map(x => localDate(x.date)).filter(Boolean);
+  if (parsed.length !== mapped.length) return null;
+  const monthKeys = new Set(parsed.map(d => `${d.getFullYear()}-${d.getMonth()+1}`));
+  const days = parsed.map(d => d.getDate());
+  const sequential = days[0] === 1 && days.every((day, i) => day === i + 1);
+  if (monthKeys.size !== 1 || !sequential) return null;
+  return mapped;
+}
+
 function correctDateColumns(dateCols, sheet, header, sourceFile) {
   // Ay bilgisini önce dosya adından, sonra sayfa adından ve üst başlık hücrelerinden bul.
-  // Kurumun şablonunda tarih hücreleri eski bir aydan kalabildiği için dosya adı güçlü kanıttır.
+  // Kurumun şablonunda alt başlık satırı bir önceki ayın tarihlerini taşıyabiliyor.
   const topText = (sheet.rows || []).slice(0, 8).flat().filter(v => v !== undefined && v !== null).join(" ");
   const fileHint = detectMonthHint(sourceFile);
   const sheetHint = detectMonthHint(sheet.name);
@@ -315,13 +331,36 @@ function correctDateColumns(dateCols, sheet, header, sourceFile) {
   const hint = fileHint || sheetHint || cellHint;
   if (!hint || !dateCols.length) return {dateCols, correction: null};
 
+  const explicitYear = detectYearHint(sourceFile, sheet.name, topText);
+
+  // Önce başlığın hemen üstündeki satırlarda aynı sütunlara denk gelen gerçek tarihleri kontrol et.
+  // Eylül şablonunda örn. alt satır Ağustos 1-31 iken üst satır Eylül 1-30 tarihlerini içeriyor.
+  for (let r = header.index - 1; r >= Math.max(0, header.index - 3); r--) {
+    const aligned = alignedDateColumns(dateCols, sheet.rows[r] || []);
+    if (!aligned) continue;
+    const first = localDate(aligned[0].date);
+    const last = localDate(aligned.at(-1).date);
+    if (!first || !last) continue;
+    const matchesMonth = first.getMonth() + 1 === hint.month && last.getMonth() + 1 === hint.month;
+    const matchesYear = !explicitYear || (first.getFullYear() === explicitYear && last.getFullYear() === explicitYear);
+    if (matchesMonth && matchesYear) {
+      return {
+        dateCols: aligned,
+        correction: {
+          from: dateCols[0].date.slice(0,7),
+          to: aligned[0].date.slice(0,7),
+          reason: "Excel üst satırındaki gerçek tarih başlığı"
+        }
+      };
+    }
+  }
+
   const rawDates = dateCols.map(x => localDate(x.date)).filter(Boolean);
   if (!rawDates.length) return {dateCols, correction: null};
 
   const rawYearCounts = new Map();
   rawDates.forEach(d => rawYearCounts.set(d.getFullYear(), (rawYearCounts.get(d.getFullYear()) || 0) + 1));
   const rawYear = [...rawYearCounts.entries()].sort((a,b) => b[1] - a[1])[0][0];
-  const explicitYear = detectYearHint(sourceFile, sheet.name, topText);
   const years = [...new Set([explicitYear, rawYear, rawYear - 1, rawYear + 1, new Date().getFullYear()].filter(Boolean))];
   const weekdayRow = header.index > 0 ? sheet.rows[header.index - 1] || [] : [];
   const originalScore = weekdayScore(dateCols, weekdayRow);
@@ -329,14 +368,14 @@ function correctDateColumns(dateCols, sheet, header, sourceFile) {
 
   for (const year of years) {
     const mapped = [];
-    let valid = true;
     for (const item of dateCols) {
       const day = localDate(item.date)?.getDate();
       const date = makeIsoDate(year, hint.month, day);
-      if (!date) { valid = false; break; }
+      // Hedef ay 30/29/28 günse eski şablondaki 31. gün sütununu atla.
+      if (!date) continue;
       mapped.push({...item, date});
     }
-    if (!valid) continue;
+    if (mapped.length < 28) continue;
     const score = weekdayScore(mapped, weekdayRow);
     if (!best || score.matched > best.score.matched || (score.matched === best.score.matched && score.compared > best.score.compared)) {
       best = {mapped, year, score};
@@ -351,7 +390,6 @@ function correctDateColumns(dateCols, sheet, header, sourceFile) {
   const nonDecreasingDays = days.every((day, i) => i === 0 || day >= days[i-1]);
   const monthMismatch = originalMonths.size === 1 && !originalMonths.has(hint.month);
   const strongWeekdayEvidence = best.score.compared >= 5 && best.score.matched / best.score.compared >= 0.8 && best.score.matched > originalScore.matched;
-  // Dosya adında ay açıkça yazıyorsa ve sütunlar 1,2,3... şeklindeyse, eski Excel ayını kesin olarak düzelt.
   const strongFileNameEvidence = Boolean(fileHint) && monthMismatch && sequentialDays;
   const supportingHintEvidence = Boolean(sheetHint || cellHint) && monthMismatch && nonDecreasingDays && best.score.matched >= originalScore.matched;
   if (!strongWeekdayEvidence && !strongFileNameEvidence && !supportingHintEvidence) return {dateCols, correction: null};
@@ -742,7 +780,7 @@ function bindEvents() {
 async function boot() {
   bindEvents();
   // Eski Mart verisinin otomatik geri yüklenmesini engelle.
-  ["vardiyacep.dataset.v1", "vardiyacep.dataset.v2", "vardiyacep.dataset.v3"].forEach(key => localStorage.removeItem(key));
+  ["vardiyacep.dataset.v1", "vardiyacep.dataset.v2", "vardiyacep.dataset.v3", "vardiyacep.dataset.v4"].forEach(key => localStorage.removeItem(key));
   if("serviceWorker" in navigator) {
     try {
       const reg = await navigator.serviceWorker.register(`service-worker.js?v=${APP_VERSION}`, {updateViaCache:"none"});
